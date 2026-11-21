@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.dq_incident import DqIncidentService
 from app.store import store
 
 
@@ -102,23 +103,21 @@ class DqCheckRunService(BaseModuleService):
 
     def _write_quality_incidents(self, task_id: str, failures: list[dict]) -> None:
         """写入质量事件记录：将巡检失败的规则关联到质量事件管理。"""
-        incident_rows = store.rows("dq_incident")
+        incident_service = DqIncidentService()
         for fail in failures:
-            new_iid = max((int(r.get("id", 0)) for r in incident_rows), default=0) + 1
-            incident_rows.append({
-                "id": new_iid,
-                "事件编号": f"DQ_I-{new_iid:04d}",
-                "关联规则": fail.get("规则编号", ""),
-                "触发时间": datetime.now(timezone.utc).isoformat(),
-                "偏离程度": "100%",
-                "影响行数": "待评估",
-                "严重级别": "warning",
-                "处理状态": "自动生成",
-                "处理人": "巡检系统",
-                "status": "待确认",
-                "pending": True,
-                "abnormal": True,
-            })
+            # 每条失败规则是独立事实，闭包各自持有，互不串扰
+            fact = dict(fail)
+            incident_service.register_quality_event(
+                source=DqIncidentService.SOURCE_CHECK_RUN,
+                assemble=lambda fact=fact: {
+                    "关联规则": fact.get("规则编号", ""),
+                    "偏离程度": "100%",
+                    "影响行数": "待评估",
+                    "严重级别": "warning",
+                    "处理状态": "自动生成",
+                    "处理人": "巡检系统",
+                },
+            )
 
     def _generate_inspection_report(self, summary: dict[str, Any]) -> None:
         """聚合巡检结果生成质量报告。"""

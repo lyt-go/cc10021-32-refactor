@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.dq_incident import DqIncidentService
 from app.store import store
 
 
@@ -114,22 +115,17 @@ class DqBaselineService(BaseModuleService):
 
         # 异常则写入质量事件
         if is_abnormal:
-            incident_rows = store.rows("dq_incident")
-            new_iid = max((int(r.get("id", 0)) for r in incident_rows), default=0) + 1
-            incident_rows.append({
-                "id": new_iid,
-                "事件编号": f"DQ_I-{new_iid:04d}",
-                "关联规则": f"baseline:{table_name}",
-                "触发时间": datetime.now(timezone.utc).isoformat(),
-                "偏离程度": max_deviation["偏离幅度"],
-                "影响行数": "待评估",
-                "严重级别": "warning",
-                "处理状态": "基线异常",
-                "处理人": "自动校验",
-                "status": "待确认",
-                "pending": True,
-                "abnormal": True,
-            })
+            DqIncidentService().register_quality_event(
+                source=DqIncidentService.SOURCE_BASELINE,
+                assemble=lambda: {
+                    "关联规则": f"baseline:{table_name}",
+                    "偏离程度": max_deviation["偏离幅度"],
+                    "影响行数": "待评估",
+                    "严重级别": "warning",
+                    "处理状态": "基线异常",
+                    "处理人": "自动校验",
+                },
+            )
 
         return {
             "目标表名": table_name,

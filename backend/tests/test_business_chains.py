@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 import sys
 import os
+import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -382,3 +383,146 @@ class TestDomainSnapshot:
             assert "operation" in snapshot, f"{svc.MODULE}缺少operation"
             assert "desc" in snapshot, f"{svc.MODULE}缺少desc"
             assert "artifact" in snapshot, f"{svc.MODULE}缺少artifact"
+
+class TestIncidentRegistrationRefactor:
+    """质量事件共用登记逻辑：并发抢号冲突、来源回查、日报当班复核清单"""
+
+    def test_single_write_keeps_original_semantics(self):
+        """普通单次写入：严重级别和处置状态沿用原口径"""
+        svc = DqIncidentService()
+        entry = svc.write_quality_incident("DQ_R-0001", "critical", "35%", "ods_order_info")
+        assert entry["严重级别"] == "critical"
+        assert entry["处理状态"] == "新建"
+        assert entry["处理人"] == "系统自动"
+        assert entry["status"] == "待确认"
+        assert entry["事件编号"] == f"DQ_I-{entry['id']:04d}"
+
+    def test_seed_incidents_preserved(self):
+        """保留原事件记录：种子事件不被改写"""
+        rows = store.rows("dq_incident")
+        assert rows[0]["事件编号"] == "DQ_I-0001"
+        assert rows[0]["关联规则"] == "质量事件管理样例1"
+        assert rows[1]["事件编号"] == "DQ_I-0002"
+        assert rows[2]["事件编号"] == "DQ_I-0003"
+
+    def test_shared_registration_covers_all_paths(self):
+        """巡检失败、指标波动、单次写入共用登记逻辑：编号唯一、口径各自保持"""
+        store.drain_review_checklist()
+        svc = DqIncidentService()
+        base = store.current_max_id("dq_incident")
+
+        DqCheckRunService()._write_quality_incidents("DQ_C-sim", [{
+            "规则编号": "DQ_R-0101", "规则类型": "空值检查",
+            "目标表名": "ods_order_info", "失败原因": "空值检查校验未通过",
+        }])
+        MetricMonitorService()._create_quality_incident(
+            "ods_order_info", "amount", {"波动幅度": "31.5%", "告警级别": "critical"})
+        svc.write_quality_incident("DQ_R-0001", "info", "5%", "ods_order_info")
+
+        rows = store.rows("dq_incident")
+        check_row, metric_row, direct_row = rows[base], rows[base + 1], rows[base + 2]
+        # 每条独立事实一个可查编号，连续且互不重叠
+        assert [r["id"] for r in (check_row, metric_row, direct_row)] == [base + 1, base + 2, base + 3]
+        assert len({r["事件编号"] for r in (check_row, metric_row, direct_row)}) == 3
+        # 各路径口径不变
+        assert (check_row["严重级别"], check_row["处理状态"], check_row["处理人"]) == ("warning", "自动生成", "巡检系统")
+        assert (metric_row["严重级别"], metric_row["处理状态"], metric_row["处理人"]) == ("critical", "新建", "auto")
+        assert metric_row["关联规则"] == "metric_monitor:ods_order_info.amount"
+        assert (direct_row["严重级别"], direct_row["处理状态"], direct_row["处理人"]) == ("info", "新建", "系统自动")
+        # 登记结果回写当班复核清单
+        checklist = store.review_checklist()
+        assert [item["来源"] for item in checklist] == ["巡检失败", "指标波动", "单次写入"]
+        assert all(item["重试次数"] == 0 for item in checklist)
+
+    def test_concurrent_conflict_retry_and_report_traceback(self):
+        """模拟：指标源字段未组装完时巡检先写入，双方读到同一最大号；
+        冲突重试后各自编号可查、来源不串，生成日报后分别回查。"""
+        store.drain_review_checklist()
+        svc = DqIncidentService()
+        base = store.current_max_id("dq_incident")
+        rows_before = len(store.rows("dq_incident"))
+
+        metric_read = threading.Event()
+        inspection_committed = threading.Event()
+        conflicts = []
+        outcome = {}
+
+        def metric_assemble():
+            # 指标告警已读到当前最大号，但源字段还没组装完
+            metric_read.set()
+            inspection_committed.wait(5)
+            return {
+                "关联规则": "metric_monitor:dwd_trade_detail.amount",
+                "偏离程度": "42.5%",
+                "影响行数": "12345",
+                "严重级别": "critical",
+                "处理状态": "新建",
+                "处理人": "auto",
+            }
+
+        def run_metric():
+            outcome["metric"] = svc.register_quality_event(
+                source=DqIncidentService.SOURCE_METRIC,
+                assemble=metric_assemble,
+                on_conflict=conflicts.append,
+            )
+
+        worker = threading.Thread(target=run_metric)
+        worker.start()
+        assert metric_read.wait(5)
+
+        # 同一轮报告期间，报告正在取事件数据：读到的是一致快照，无中间态
+        mid_snapshot = store.snapshot("dq_incident")
+        assert max(int(r["id"]) for r in mid_snapshot) == base
+
+        # 巡检失败读到同一个最大号，并先完成写入
+        inspection_entry = svc.register_quality_event(
+            source=DqIncidentService.SOURCE_CHECK_RUN,
+            assemble=lambda: {
+                "关联规则": "DQ_R-0102",
+                "偏离程度": "100%",
+                "影响行数": "待评估",
+                "严重级别": "warning",
+                "处理状态": "自动生成",
+                "处理人": "巡检系统",
+            },
+        )
+        inspection_committed.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        metric_entry = outcome["metric"]
+
+        # 并发抢号冲突真实发生：指标第一次提交失败，重试后拿到新号
+        assert conflicts == [1]
+        assert len(store.rows("dq_incident")) == rows_before + 2
+        # 每条独立事实一个可查编号
+        assert inspection_entry["id"] == base + 1
+        assert metric_entry["id"] == base + 2
+        all_rows = store.rows("dq_incident")
+        assert len({r["id"] for r in all_rows}) == len(all_rows)
+        assert len({r["事件编号"] for r in all_rows}) == len(all_rows)
+        # 来源不串：各自事实保持各自路径的字段
+        assert inspection_entry["处理人"] == "巡检系统"
+        assert metric_entry["关联规则"] == "metric_monitor:dwd_trade_detail.amount"
+        assert metric_entry["严重级别"] == "critical"
+
+        # 生成日报：聚合巡检与波动产生的事件记录
+        report_svc = DqReportService()
+        report = report_svc.aggregate_quality_report("daily")
+        assert report["质量事件总数"] == len(store.snapshot("dq_incident"))
+        checklist = report["当班复核清单"]
+        by_no = {item["事件编号"]: item for item in checklist}
+        # 保持原有级别含义
+        assert by_no[inspection_entry["事件编号"]]["严重级别"] == "warning"
+        assert by_no[metric_entry["事件编号"]]["严重级别"] == "critical"
+
+        # 分别回查独立事件及失败的那次重试（清单已随日报归档，仍可回查）
+        assert store.review_checklist() == []
+        inspection_src = report_svc.lookup_event_source(inspection_entry["事件编号"])
+        metric_src = report_svc.lookup_event_source(metric_entry["事件编号"])
+        assert inspection_src["来源"] == "巡检失败"
+        assert inspection_src["重试次数"] == 0
+        assert metric_src["来源"] == "指标波动"
+        assert metric_src["重试次数"] == 1
+        assert metric_src["源字段"]["关联规则"] == "metric_monitor:dwd_trade_detail.amount"
+        assert inspection_src["源字段"]["处理人"] == "巡检系统"

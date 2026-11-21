@@ -31,8 +31,8 @@ class DqReportService(BaseModuleService):
         查询巡检执行记录、质量事件、评分卡和趋势数据，
         聚合各维度指标计算结果，写入质量报告记录并导出趋势快照。
         """
-        # 查询各模块数据
-        incident_rows = store.rows("dq_incident")
+        # 查询各模块数据（事件表取一致快照：并发登记期间报告读到的不是中间态）
+        incident_rows = store.snapshot("dq_incident")
         check_rows = store.rows("dq_check_run")
         scorecard_rows = store.rows("dq_scorecard")
         trend_rows = store.rows("dq_trend")
@@ -59,7 +59,8 @@ class DqReportService(BaseModuleService):
         if quality_values:
             avg_quality = sum(quality_values) / len(quality_values)
 
-        # 写入质量报告记录
+        # 写入质量报告记录（事件登记结果随当班复核清单归档到报告，可按来源回查）
+        checklist = store.drain_review_checklist()
         rows = store.rows(self.MODULE)
         new_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
         report = {
@@ -72,6 +73,7 @@ class DqReportService(BaseModuleService):
             "趋势分析": "上升" if avg_quality >= 85 else "平稳" if avg_quality >= 70 else "下降",
             "生成时间": datetime.now(timezone.utc).isoformat(),
             "报告版本": "v1.0",
+            "当班复核清单": checklist,
             "status": "已完成",
             "pending": False,
             "abnormal": failed_checks > passed_checks,
@@ -94,7 +96,23 @@ class DqReportService(BaseModuleService):
             "维度得分": dim_scores,
             "生成时间": report["生成时间"],
             "趋势": report["趋势分析"],
+            "当班复核清单": checklist,
         }
+
+    def lookup_event_source(self, event_no: str) -> dict[str, Any] | None:
+        """按事件编号回查真实来源：先查当班复核清单，再查历史报告归档的清单。
+
+        巡检失败、指标波动等任一路径登记的事件，都能按事件编号回查到
+        登记时的真实来源、源字段快照和重试次数。
+        """
+        for item in store.review_checklist():
+            if item.get("事件编号") == event_no:
+                return item
+        for row in store.rows(self.MODULE):
+            for item in row.get("当班复核清单", []):
+                if item.get("事件编号") == event_no:
+                    return item
+        return None
 
     def _compute_dimension_scores(self, scorecard_rows: list[dict]) -> dict[str, float]:
         """计算质量维度得分汇总：完整性、准确性、时效性、唯一性。"""

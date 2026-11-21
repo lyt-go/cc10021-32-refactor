@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.dq_incident import DqIncidentService
 from app.store import store
 
 
@@ -109,22 +110,17 @@ class DqTrendService(BaseModuleService):
 
     def _alert_trend_downturn(self, table_name: str, direction: str, change_rate: float) -> None:
         """检测到质量下降趋势，写入质量事件并触发告警。"""
-        incident_rows = store.rows("dq_incident")
-        new_iid = max((int(r.get("id", 0)) for r in incident_rows), default=0) + 1
-        incident_rows.append({
-            "id": new_iid,
-            "事件编号": f"DQ_I-{new_iid:04d}",
-            "关联规则": f"trend:{table_name}",
-            "触发时间": datetime.now(timezone.utc).isoformat(),
-            "偏离程度": f"{abs(change_rate):.1f}%",
-            "影响行数": "全局",
-            "严重级别": "warning" if abs(change_rate) > 10 else "info",
-            "处理状态": "趋势告警",
-            "处理人": "趋势分析引擎",
-            "status": "待确认",
-            "pending": True,
-            "abnormal": True,
-        })
+        DqIncidentService().register_quality_event(
+            source=DqIncidentService.SOURCE_TREND,
+            assemble=lambda: {
+                "关联规则": f"trend:{table_name}",
+                "偏离程度": f"{abs(change_rate):.1f}%",
+                "影响行数": "全局",
+                "严重级别": "warning" if abs(change_rate) > 10 else "info",
+                "处理状态": "趋势告警",
+                "处理人": "趋势分析引擎",
+            },
+        )
 
     def aggregate_trend_comparison(self, table_names: list[str]) -> dict[str, Any]:
         """聚合多表质量趋势对比，生成综合排名。

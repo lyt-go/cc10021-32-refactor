@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.dq_incident import DqIncidentService
 from app.store import store
 
 
@@ -76,22 +77,19 @@ class MetricMonitorService(BaseModuleService):
     def _create_quality_incident(self, table_name: str, metric_field: str,
                                   metric_result: dict[str, Any]) -> None:
         """写入质量事件记录，将指标异常事件关联到质量事件管理。"""
-        incident_rows = store.rows("dq_incident")
-        new_iid = max((int(r.get("id", 0)) for r in incident_rows), default=0) + 1
-        incident_rows.append({
-            "id": new_iid,
-            "事件编号": f"DQ_I-{new_iid:04d}",
+        # 本条波动事实是独立事实，源字段闭包自持，不与其他来源串扰
+        fact = {
             "关联规则": f"metric_monitor:{table_name}.{metric_field}",
-            "触发时间": datetime.now(timezone.utc).isoformat(),
             "偏离程度": metric_result["波动幅度"],
             "影响行数": str(random.randint(1000, 500000)),
             "严重级别": metric_result.get("告警级别", "warning"),
             "处理状态": "新建",
             "处理人": "auto",
-            "status": "待确认",
-            "pending": True,
-            "abnormal": True,
-        })
+        }
+        DqIncidentService().register_quality_event(
+            source=DqIncidentService.SOURCE_METRIC,
+            assemble=lambda: dict(fact),
+        )
 
     def _trigger_alert(self, table_name: str, field_name: str, level: str, volatility: float) -> None:
         """触发告警通知：将波动告警关联到告警通道配置，发起通知。"""
